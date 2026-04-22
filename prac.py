@@ -38,26 +38,23 @@ VIX_FILE   = 'ivd.csv'
 # ---------------------------
 def load_nifty(path):
     print(f"Loading NIFTY CSV: {path}")
-    # Attempts DD-MM-YY parsing
     df = pd.read_csv(
         path,
         skiprows=2,
-        parse_dates=['Date'],
-        date_parser=lambda x: pd.to_datetime(x, format="%d-%m-%y", errors='coerce')
     )
+    df['Date'] = pd.to_datetime(df['Date'], format="%d-%m-%y", errors='coerce')
     df.columns = [c.strip() for c in df.columns]
     df = df.set_index('Date').sort_index()
     return df[['Open','High','Low','Close','Volume']]
 
 def load_vix(path):
     print(f"Loading India VIX CSV: {path}")
-    # Attempts YYYY-MM-DD parsing
     df = pd.read_csv(
         path,
         skiprows=2,
-        parse_dates=['Date'],
-        date_parser=lambda x: pd.to_datetime(x, format="%Y-%m-%d", errors='coerce')
     )
+    # Changed to %d-%m-%y to match the new CSV format
+    df['Date'] = pd.to_datetime(df['Date'], format="%d-%m-%y", errors='coerce')
     df.columns = [c.strip() for c in df.columns]
     df = df.set_index('Date').sort_index()
     return df[['Open','High','Low','Close','Volume']]
@@ -117,9 +114,16 @@ df = df.dropna()
 # 3. Scientific HMM State Selection (AIC/BIC)
 # ---------------------------
 print("\n=== Optimizing HMM States ===")
-# We use Returns and Volatility as primary regime drivers
-hmm_features = ['return', 'vol_20'] 
-X_hmm = df[hmm_features].values
+# We use Returns, Volatility, and VIX Z-Score to form regimes
+hmm_features = ['return', 'vol_20', 'vix_zscore'] 
+X_hmm_raw = df[hmm_features].values
+
+# Scale features so variances don't overwhelm the model
+scaler = StandardScaler()
+X_hmm = scaler.fit_transform(X_hmm_raw)
+
+import warnings
+warnings.filterwarnings("ignore")
 
 best_score = float('inf')
 best_k = 3
@@ -128,14 +132,19 @@ best_model = None
 # Loop to find optimal K (2 to 5)
 for k in range(2, 6):
     try:
-        tmp_model = GaussianHMM(n_components=k, covariance_type='diag', n_iter=1000, random_state=42)
+        tmp_model = GaussianHMM(n_components=k, covariance_type='full', n_iter=1000, random_state=42)
         tmp_model.fit(X_hmm)
         
         # Calculate AIC: AIC = -2 * logL + 2 * k * n_features
-        # (Simplified approximation for model selection)
         logL = tmp_model.score(X_hmm)
         n_features = X_hmm.shape[1]
-        n_params = k * (n_features + n_features + k - 1) # Means + Vars + TransMat
+        
+        # Number of parameters for 'full' covariance: 
+        # Transitions: k*(k-1)
+        # Means: k*n_features
+        # Covariances: k * n_features * (n_features + 1) / 2
+        n_params = k * (k - 1) + k * n_features + k * n_features * (n_features + 1) / 2
+        
         aic = -2 * logL + 2 * n_params
         
         print(f"States: {k} | LogL: {logL:.2f} | AIC: {aic:.2f}")
@@ -144,7 +153,8 @@ for k in range(2, 6):
             best_score = aic
             best_k = k
             best_model = tmp_model
-    except:
+    except Exception as e:
+        print(f"Error fitting K={k}: {e}")
         continue
 
 print(f"-> Selected Optimal States: {best_k}")
@@ -159,14 +169,20 @@ print("\nState Statistics:\n", state_stats)
 
 # Sort states by mean return: Lowest = Bear, Highest = Bull
 sorted_states = state_stats.sort_values('mean').index
-state_mapping = {}
-labels = ['Bear', 'Neutral', 'Bull', 'Strong Bull'] # generic labels based on K
 
-for i, state_id in enumerate(sorted_states):
-    if i < len(labels):
-        state_mapping[state_id] = labels[i]
-    else:
-        state_mapping[state_id] = f"State_{state_id}"
+# Dynamic labeling based on optimal K
+if best_k == 2:
+    labels = ['Bear', 'Bull']
+elif best_k == 3:
+    labels = ['Bear', 'Neutral', 'Bull']
+elif best_k == 4:
+    labels = ['Bear', 'Neutral', 'Bull', 'Strong Bull']
+elif best_k == 5:
+    labels = ['Strong Bear', 'Bear', 'Neutral', 'Bull', 'Strong Bull']
+else:
+    labels = [f"State_{i}" for i in range(best_k)]
+
+state_mapping = {state_id: labels[i] for i, state_id in enumerate(sorted_states)}
 
 print("State Mapping:", state_mapping)
 df['regime_desc'] = df['hmm_state'].map(state_mapping)
@@ -196,13 +212,13 @@ plt.close()
 # ---------------------------
 print("\n=== Running Strategy Backtest ===")
 
-# Define weights: Bear=0% (Cash), Neutral=50%, Bull=100%
-# You can tweak these. E.g., Bear = -0.5 for shorting.
+# Define dynamic weights based on new labels
 weight_map = {
-    'Bear': 0.0,
-    'Neutral': 0.6,
-    'Bull': 1.0, 
-    'Strong Bull': 1.2
+    'Strong Bear': -0.5, # Shorting allowed
+    'Bear': 0.0,         # Cash
+    'Neutral': 0.5,      # 50% Exposure
+    'Bull': 1.0,         # 100% Fully Invested
+    'Strong Bull': 1.5   # 150% Leveraged
 }
 
 # Apply weights (Default to 0.5 if label not found)
@@ -210,19 +226,36 @@ df['strategy_weight'] = df['regime_desc'].map(weight_map).fillna(0.5)
 
 # IMPORTANT: Shift weights by 1 day. 
 # We detect regime at Close today -> We trade at Open tomorrow (or capture tomorrow's return).
-df['strategy_weight'] = df['strategy_weight'].shift(1).fillna(0)
+df['target_position'] = df['strategy_weight'].shift(1).fillna(0)
+
+# Factor in transaction costs for turnover (10 bps per trade)
+tc_rate = 0.0010
+df['turnover'] = df['target_position'].diff().abs().fillna(0)
 
 df['buy_hold_ret'] = df['return']
-df['strategy_ret'] = df['return'] * df['strategy_weight']
+# Realistic strategy return (Net of trading costs)
+df['strategy_ret'] = (df['return'] * df['target_position']) - (df['turnover'] * tc_rate)
 
 # Cumulative Returns
 df['cum_buy_hold'] = (1 + df['buy_hold_ret']).cumprod()
 df['cum_strategy'] = (1 + df['strategy_ret']).cumprod()
 
+print(f"-> Buy & Hold Return: {(df['cum_buy_hold'].iloc[-1] - 1) * 100:.2f}%")
+print(f"-> HMM Strategy Return (Net): {(df['cum_strategy'].iloc[-1] - 1) * 100:.2f}%")
+
+# Latest Recommendation
+current_regime = df['regime_desc'].iloc[-1]
+next_day_weight = df['strategy_weight'].iloc[-1] # No shift for current day signal
+print(f"\n=> LIVE SIGNAL ----------------------------")
+print(f"=> Last close Date: {df.index[-1].strftime('%Y-%m-%d')}")
+print(f"=> Current Regime: {current_regime}")
+print(f"=> Recommended Market Exposure Tomorrow: {next_day_weight * 100:.0f}%")
+print(f"-------------------------------------------\n")
+
 # Plot Backtest
 plt.figure(figsize=(12, 6))
 plt.plot(df.index, df['cum_buy_hold'], label='Buy & Hold (Nifty)', color='gray')
-plt.plot(df.index, df['cum_strategy'], label='HMM Strategy', color='blue')
+plt.plot(df.index, df['cum_strategy'], label='HMM Strategy (Net of Costs)', color='blue')
 plt.title(f'Strategy Backtest (Final Capital: {df["cum_strategy"].iloc[-1]:.2f}x)')
 plt.yscale('log')
 plt.legend()
@@ -241,10 +274,14 @@ FORECAST_DAYS = 20
 # GJR-GARCH(1,1) with Student's T distribution
 # o=1 enables asymmetry (Leverage effect)
 # dist='t' handles fat tails
-am = arch_model(ret_pct, vol='Garch', p=1, o=1, q=1, dist='t')
-res = am.fit(disp='off')
-
-print(res.summary())
+am = arch_model(ret_pct, vol='Garch', p=1, o=1, q=1, dist='t', rescale=False)
+try:
+    res = am.fit(disp='off', options={'ftol': 1e-4})
+    print(res.summary())
+except Exception as e:
+    print(f"GARCH Error: {e}\nRetrying with continuous scaling...")
+    res = am.fit(disp='off', update_freq=0)
+    print(res.summary())
 
 # Forecast
 fcast = res.forecast(horizon=FORECAST_DAYS)
@@ -263,10 +300,29 @@ forecast_df = pd.DataFrame({
 
 forecast_df.to_csv(os.path.join(OUTPUT_DIR, 'garch_future_vol.csv'))
 
-plt.figure(figsize=(10, 5))
-plt.plot(forecast_df.index, forecast_df['annualized_vol_pct'], marker='o')
-plt.title(f'GJR-GARCH Volatility Forecast (Next {FORECAST_DAYS} Days)')
-plt.ylabel('Annualized Volatility %')
+# Get recent historical volatility for context (last 60 days)
+hist_vol = df['vol_20'].iloc[-60:] * 100
+
+plt.figure(figsize=(12, 6))
+
+# Plot Historical Volatility
+plt.plot(hist_vol.index, hist_vol, label='Historical Volatility (20-day)', color='blue', linewidth=2)
+
+# Seamless connection between historical and forecast
+conn_idx = [hist_vol.index[-1], forecast_df.index[0]]
+conn_val = [hist_vol.iloc[-1], forecast_df['annualized_vol_pct'].iloc[0]]
+plt.plot(conn_idx, conn_val, color='red', linestyle='--', linewidth=2)
+
+# Plot Forecast Volatility
+plt.plot(forecast_df.index, forecast_df['annualized_vol_pct'], label='GARCH Forecast', color='red', linestyle='--', marker='o', linewidth=2)
+plt.fill_between(forecast_df.index, forecast_df['annualized_vol_pct'], alpha=0.2, color='red')
+
+plt.title(f'GJR-GARCH Volatility Forecast (Next {FORECAST_DAYS} Days)', fontsize=14, fontweight='bold')
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Annualized Volatility (%)', fontsize=12)
+plt.axvline(x=hist_vol.index[-1], color='black', linestyle='-.', alpha=0.5, label='Current Date')
+plt.legend()
+plt.xticks(rotation=45)
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, 'garch_forecast.png'))
 plt.close()
@@ -286,14 +342,15 @@ for _ in range(FORECAST_DAYS):
     state_vec = state_vec @ T
     probs.append(state_vec.copy())
 
-prob_df = pd.DataFrame(probs, index=future_dates, columns=[f'State_{i}' for i in range(best_k)])
+# Reorder state arrays according to state mapping names
+prob_cols = [state_mapping.get(i, f'State_{i}') for i in range(best_k)]
+prob_df = pd.DataFrame(probs, index=future_dates, columns=prob_cols)
 prob_df.to_csv(os.path.join(OUTPUT_DIR, 'hmm_future_probs.csv'))
 
 # Plot Probabilities
 plt.figure(figsize=(12, 5))
-for i in range(best_k):
-    lbl = state_mapping.get(i, f'State {i}')
-    plt.plot(prob_df.index, prob_df[f'State_{i}'], label=lbl)
+for col in prob_cols:
+    plt.plot(prob_df.index, prob_df[col], label=col)
 
 plt.title('Future Regime Probabilities')
 plt.legend()
